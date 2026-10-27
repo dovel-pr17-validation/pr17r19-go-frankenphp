@@ -1,0 +1,200 @@
+package frankenphp
+
+// #include "frankenphp.h"
+import "C"
+import (
+	"log/slog"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/dunglas/frankenphp/internal/state"
+)
+
+// representation of a non-worker PHP thread
+// executes PHP scripts in a web context
+// implements the threadHandler interface
+type regularThread struct {
+	fc           *frankenPHPContext
+	state        *state.ThreadState
+	thread       *phpThread
+	requestCount int
+}
+
+var (
+	regularThreads       []*phpThread
+	regularThreadMu      = &sync.RWMutex{}
+	regularRequestChan   = make(chan *frankenPHPContext)
+	queuedRegularThreads = atomic.Int32{}
+)
+
+func convertToRegularThread(thread *phpThread) {
+	thread.setHandler(&regularThread{
+		thread: thread,
+		state:  thread.state,
+	})
+	attachRegularThread(thread)
+}
+
+// beforeScriptExecution returns the name of the script or an empty string on shutdown
+func (handler *regularThread) beforeScriptExecution() string {
+	switch handler.state.Get() {
+	case state.TransitionRequested:
+		detachRegularThread(handler.thread)
+		return handler.thread.transitionToNewHandler()
+
+	case state.TransitionComplete:
+		handler.thread.updateContext(false)
+		handler.state.Set(state.Ready)
+
+		return handler.waitForRequest()
+	case state.Ready:
+		return handler.waitForRequest()
+	case state.Rebooting, state.ForceRebooting:
+		return ""
+	case state.RebootReady:
+		handler.requestCount = 0
+		handler.state.Set(state.Ready)
+		return handler.waitForRequest()
+
+	case state.ShuttingDown:
+		detachRegularThread(handler.thread)
+		// signal to stop
+		return ""
+	}
+
+	panic("unexpected state: " + handler.state.Name())
+}
+
+func (handler *regularThread) afterScriptExecution(_ int) {
+	handler.thread.requestCount.Add(1)
+	handler.afterRequest()
+}
+
+func (handler *regularThread) frankenPHPContext() *frankenPHPContext {
+	return handler.fc
+}
+
+func (handler *regularThread) name() string {
+	return "Regular PHP Thread"
+}
+
+func (handler *regularThread) drain() {}
+
+func (handler *regularThread) waitForRequest() string {
+	// max_requests reached: restart the thread to clean up all ZTS state
+	if maxRequestsPerThread > 0 && handler.requestCount >= maxRequestsPerThread {
+		if globalLogger.Enabled(globalCtx, slog.LevelDebug) {
+			globalLogger.LogAttrs(globalCtx, slog.LevelDebug, "max requests reached, restarting thread",
+				slog.Int("thread", handler.thread.threadIndex),
+				slog.Int("max_requests", maxRequestsPerThread),
+			)
+		}
+
+		if handler.thread.reboot() {
+			return ""
+		}
+	}
+
+	handler.state.MarkAsWaiting(true)
+
+	var fc *frankenPHPContext
+
+	select {
+	case <-handler.thread.drainChan:
+		// go back to beforeScriptExecution
+		return handler.beforeScriptExecution()
+	case fc = <-regularRequestChan:
+	case fc = <-handler.thread.requestChan:
+	}
+
+	handler.requestCount++
+	handler.thread.contextMu.Lock()
+	handler.fc = fc
+	handler.thread.contextMu.Unlock()
+	handler.state.MarkAsWaiting(false)
+
+	return fc.scriptFilename
+}
+
+func (handler *regularThread) afterRequest() {
+	handler.fc.closeContext()
+	handler.thread.contextMu.Lock()
+	handler.fc = nil
+	handler.thread.contextMu.Unlock()
+}
+
+func handleRequestWithRegularPHPThreads(fc *frankenPHPContext) error {
+	metrics.StartRequest()
+
+	runtime.Gosched()
+
+	if queuedRegularThreads.Load() == 0 {
+		regularThreadMu.RLock()
+		for _, thread := range regularThreads {
+			select {
+			case thread.requestChan <- fc:
+				regularThreadMu.RUnlock()
+				<-fc.done
+				metrics.StopRequest()
+
+				return nil
+			default:
+				// thread was not available
+			}
+		}
+		regularThreadMu.RUnlock()
+	}
+
+	// if no thread was available, mark the request as queued and fan it out to all threads
+	queuedRegularThreads.Add(1)
+	metrics.QueuedRequest()
+
+	for {
+		select {
+		case regularRequestChan <- fc:
+			queuedRegularThreads.Add(-1)
+			metrics.DequeuedRequest()
+
+			<-fc.done
+			metrics.StopRequest()
+
+			return nil
+		case scaleChan <- fc:
+			// the request has triggered scaling, continue to wait for a thread
+		case <-fc.ctx.Done():
+			queuedRegularThreads.Add(-1)
+			metrics.DequeuedRequest()
+			metrics.StopRequest()
+
+			return nil
+		case <-timeoutChan(time.Duration(maxWaitTime.Load())):
+			// the request has timed out stalling
+			queuedRegularThreads.Add(-1)
+			metrics.DequeuedRequest()
+			metrics.StopRequest()
+
+			fc.reject(ErrMaxWaitTimeExceeded)
+
+			return ErrMaxWaitTimeExceeded
+		}
+	}
+}
+
+func attachRegularThread(thread *phpThread) {
+	regularThreadMu.Lock()
+	regularThreads = append(regularThreads, thread)
+	regularThreadMu.Unlock()
+}
+
+func detachRegularThread(thread *phpThread) {
+	regularThreadMu.Lock()
+	for i, t := range regularThreads {
+		if t == thread {
+			regularThreads = append(regularThreads[:i], regularThreads[i+1:]...)
+			break
+		}
+	}
+	regularThreadMu.Unlock()
+}

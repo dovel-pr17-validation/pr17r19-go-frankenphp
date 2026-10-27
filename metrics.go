@@ -1,0 +1,444 @@
+package frankenphp
+
+import (
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	StopReasonCrash = iota
+	StopReasonRestart
+	StopReasonBootFailure // worker crashed before reaching frankenphp_handle_request
+)
+
+type StopReason int
+
+// Metrics reports what the workers and the threads of a FrankenPHP instance
+// are doing. An implementation that also satisfies OpcacheMetrics is told
+// about opcache restarts as well.
+type Metrics interface {
+	// StartWorker collects started workers
+	StartWorker(name string)
+	// ReadyWorker collects ready workers
+	ReadyWorker(name string)
+	// StopWorker collects stopped workers
+	StopWorker(name string, reason StopReason)
+	// TotalWorkers collects expected workers
+	TotalWorkers(name string, num int)
+	// TotalThreads collects total threads
+	TotalThreads(num int)
+	// StartRequest collects started requests
+	StartRequest()
+	// StopRequest collects stopped requests
+	StopRequest()
+	// StopWorkerRequest collects stopped worker requests
+	StopWorkerRequest(name string, duration time.Duration)
+	// StartWorkerRequest collects started worker requests
+	StartWorkerRequest(name string)
+	Shutdown()
+	QueuedWorkerRequest(name string)
+	DequeuedWorkerRequest(name string)
+	QueuedRequest()
+	DequeuedRequest()
+}
+
+// OpcacheMetrics is the optional part of a Metrics implementation that counts
+// the restarts of opcache's shared memory, by reason, where the build reports
+// them (ZTS, PHP 8.4 and up). An implementation passed to WithMetrics() that
+// lacks it only misses the counter, the restart is logged either way.
+type OpcacheMetrics interface {
+	OpcacheRestart(reason string)
+}
+
+type nullMetrics struct{}
+
+func (n nullMetrics) StartWorker(string) {
+}
+
+func (n nullMetrics) ReadyWorker(string) {
+}
+
+func (n nullMetrics) StopWorker(string, StopReason) {
+}
+
+func (n nullMetrics) TotalWorkers(string, int) {
+}
+
+func (n nullMetrics) TotalThreads(int) {
+}
+
+func (n nullMetrics) StartRequest() {
+}
+
+func (n nullMetrics) StopRequest() {
+}
+
+func (n nullMetrics) StopWorkerRequest(string, time.Duration) {
+}
+
+func (n nullMetrics) StartWorkerRequest(string) {
+}
+
+func (n nullMetrics) Shutdown() {
+}
+
+func (n nullMetrics) QueuedWorkerRequest(string) {}
+
+func (n nullMetrics) DequeuedWorkerRequest(string) {}
+
+func (n nullMetrics) QueuedRequest()   {}
+func (n nullMetrics) DequeuedRequest() {}
+
+type PrometheusMetrics struct {
+	registry           prometheus.Registerer
+	totalThreads       prometheus.Gauge
+	busyThreads        prometheus.Gauge
+	totalWorkers       *prometheus.GaugeVec
+	busyWorkers        *prometheus.GaugeVec
+	readyWorkers       *prometheus.GaugeVec
+	workerCrashes      *prometheus.CounterVec
+	workerRestarts     *prometheus.CounterVec
+	workerRequestTime  *prometheus.CounterVec
+	workerRequestCount *prometheus.CounterVec
+	workerQueueDepth   *prometheus.GaugeVec
+	queueDepth         prometheus.Gauge
+	opcacheRestarts    *prometheus.CounterVec
+	mu                 sync.RWMutex
+}
+
+// mustRegister registers c, tolerating a collector that is already registered.
+func (m *PrometheusMetrics) mustRegister(c prometheus.Collector) {
+	if err := m.registry.Register(c); err != nil {
+		if _, ok := errors.AsType[prometheus.AlreadyRegisteredError](err); !ok {
+			panic(err)
+		}
+	}
+}
+
+var (
+	_ Metrics        = (*PrometheusMetrics)(nil)
+	_ OpcacheMetrics = (*PrometheusMetrics)(nil)
+)
+
+func (m *PrometheusMetrics) StartWorker(name string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.busyThreads.Inc()
+
+	// tests do not register workers before starting them
+	if m.totalWorkers == nil {
+		return
+	}
+
+	m.totalWorkers.WithLabelValues(name).Inc()
+}
+
+func (m *PrometheusMetrics) ReadyWorker(name string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.totalWorkers == nil {
+		return
+	}
+
+	m.readyWorkers.WithLabelValues(name).Inc()
+}
+
+func (m *PrometheusMetrics) StopWorker(name string, reason StopReason) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.busyThreads.Dec()
+
+	// tests do not register workers before starting them
+	if m.totalWorkers == nil {
+		return
+	}
+
+	m.totalWorkers.WithLabelValues(name).Dec()
+
+	// only decrement readyWorkers if the worker actually reached frankenphp_handle_request
+	if reason != StopReasonBootFailure {
+		m.readyWorkers.WithLabelValues(name).Dec()
+	}
+
+	switch reason {
+	case StopReasonCrash, StopReasonBootFailure:
+		m.workerCrashes.WithLabelValues(name).Inc()
+	case StopReasonRestart:
+		m.workerRestarts.WithLabelValues(name).Inc()
+	}
+}
+
+func (m *PrometheusMetrics) TotalWorkers(string, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	const ns, sub = "frankenphp", "worker"
+	basicLabels := []string{"worker"}
+
+	if m.totalWorkers == nil {
+		m.totalWorkers = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "total_workers",
+			Help:      "Total number of PHP workers for this worker",
+		}, basicLabels)
+		m.mustRegister(m.totalWorkers)
+	}
+
+	if m.readyWorkers == nil {
+		m.readyWorkers = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "ready_workers",
+			Help:      "Running workers that have successfully called frankenphp_handle_request at least once",
+		}, basicLabels)
+		m.mustRegister(m.readyWorkers)
+	}
+
+	if m.busyWorkers == nil {
+		m.busyWorkers = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "busy_workers",
+			Help:      "Number of busy PHP workers for this worker",
+		}, basicLabels)
+		m.mustRegister(m.busyWorkers)
+	}
+
+	if m.workerCrashes == nil {
+		m.workerCrashes = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "crashes",
+			Help:      "Number of PHP worker crashes for this worker",
+		}, basicLabels)
+		m.mustRegister(m.workerCrashes)
+	}
+
+	if m.workerRestarts == nil {
+		m.workerRestarts = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "restarts",
+			Help:      "Number of PHP worker restarts for this worker",
+		}, basicLabels)
+		m.mustRegister(m.workerRestarts)
+	}
+
+	if m.workerRequestTime == nil {
+		m.workerRequestTime = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "request_time",
+		}, basicLabels)
+		m.mustRegister(m.workerRequestTime)
+	}
+
+	if m.workerRequestCount == nil {
+		m.workerRequestCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "request_count",
+		}, basicLabels)
+		m.mustRegister(m.workerRequestCount)
+	}
+
+	if m.workerQueueDepth == nil {
+		m.workerQueueDepth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "frankenphp",
+			Subsystem: sub,
+			Name:      "queue_depth",
+		}, basicLabels)
+		m.mustRegister(m.workerQueueDepth)
+	}
+}
+
+func (m *PrometheusMetrics) TotalThreads(num int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.totalThreads.Set(float64(num))
+}
+
+func (m *PrometheusMetrics) StartRequest() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.busyThreads.Inc()
+}
+
+func (m *PrometheusMetrics) StopRequest() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.busyThreads.Dec()
+}
+
+func (m *PrometheusMetrics) StopWorkerRequest(name string, duration time.Duration) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.workerRequestTime == nil {
+		return
+	}
+
+	m.workerRequestCount.WithLabelValues(name).Inc()
+	m.busyWorkers.WithLabelValues(name).Dec()
+	m.workerRequestTime.WithLabelValues(name).Add(duration.Seconds())
+}
+
+func (m *PrometheusMetrics) StartWorkerRequest(name string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.busyWorkers == nil {
+		return
+	}
+	m.busyWorkers.WithLabelValues(name).Inc()
+}
+
+func (m *PrometheusMetrics) QueuedWorkerRequest(name string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.workerQueueDepth == nil {
+		return
+	}
+	m.workerQueueDepth.WithLabelValues(name).Inc()
+}
+
+func (m *PrometheusMetrics) DequeuedWorkerRequest(name string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.workerQueueDepth == nil {
+		return
+	}
+	m.workerQueueDepth.WithLabelValues(name).Dec()
+}
+
+func (m *PrometheusMetrics) QueuedRequest() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.queueDepth.Inc()
+}
+
+func (m *PrometheusMetrics) DequeuedRequest() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	m.queueDepth.Dec()
+}
+
+func (m *PrometheusMetrics) OpcacheRestart(reason string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.opcacheRestarts != nil {
+		m.opcacheRestarts.WithLabelValues(reason).Inc()
+	}
+}
+
+func (m *PrometheusMetrics) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.registry.Unregister(m.totalThreads)
+	m.registry.Unregister(m.busyThreads)
+	m.registry.Unregister(m.queueDepth)
+
+	if m.opcacheRestarts != nil {
+		m.registry.Unregister(m.opcacheRestarts)
+	}
+
+	if m.totalWorkers != nil {
+		m.registry.Unregister(m.totalWorkers)
+	}
+
+	if m.busyWorkers != nil {
+		m.registry.Unregister(m.busyWorkers)
+	}
+
+	if m.workerRequestTime != nil {
+		m.registry.Unregister(m.workerRequestTime)
+	}
+
+	if m.workerRequestCount != nil {
+		m.registry.Unregister(m.workerRequestCount)
+	}
+
+	if m.workerCrashes != nil {
+		m.registry.Unregister(m.workerCrashes)
+	}
+
+	if m.workerRestarts != nil {
+		m.registry.Unregister(m.workerRestarts)
+	}
+
+	if m.readyWorkers != nil {
+		m.registry.Unregister(m.readyWorkers)
+	}
+
+	if m.workerQueueDepth != nil {
+		m.registry.Unregister(m.workerQueueDepth)
+	}
+}
+
+func NewPrometheusMetrics(registry prometheus.Registerer) *PrometheusMetrics {
+	if registry == nil {
+		registry = prometheus.NewRegistry()
+	}
+
+	m := &PrometheusMetrics{
+		registry: registry,
+		totalThreads: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "frankenphp_total_threads",
+			Help: "Total number of PHP threads",
+		}),
+		busyThreads: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "frankenphp_busy_threads",
+			Help: "Number of busy PHP threads",
+		}),
+		queueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "frankenphp_queue_depth",
+			Help: "Number of regular queued requests",
+		}),
+		// experimental: to be removed once opcache handles restarts safely under ZTS
+		opcacheRestarts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "frankenphp_opcache_restarts",
+			Help: "Number of restarts of opcache's shared memory scheduled, by reason (experimental, should stay at zero)",
+		}, []string{"reason"}),
+		totalWorkers:       nil,
+		busyWorkers:        nil,
+		workerRequestTime:  nil,
+		workerRequestCount: nil,
+		workerRestarts:     nil,
+		workerCrashes:      nil,
+		readyWorkers:       nil,
+		workerQueueDepth:   nil,
+	}
+
+	m.mustRegister(m.totalThreads)
+
+	m.mustRegister(m.busyThreads)
+
+	m.mustRegister(m.queueDepth)
+
+	// only where the hook exists: a series stuck at zero would read as "no
+	// restart" on a build that cannot report one
+	if opcacheRestartHook {
+		m.mustRegister(m.opcacheRestarts)
+
+		// expose the series at zero so a rate or an alert on it works from the
+		// first restart on, instead of missing it for lack of a previous sample
+		for _, reason := range opcacheRestartReasons {
+			m.opcacheRestarts.WithLabelValues(reason)
+		}
+	}
+
+	return m
+}

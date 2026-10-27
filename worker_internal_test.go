@@ -1,0 +1,211 @@
+package frankenphp
+
+import (
+	"context"
+	"log/slog"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/dunglas/frankenphp/internal/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCancelledRequestLeavesWorkerQueue(t *testing.T) {
+	savedMaxWaitTime := maxWaitTime.Swap(0)
+	savedScaleChan := scaleChan
+	scaleChan = nil
+	t.Cleanup(func() {
+		maxWaitTime.Store(savedMaxWaitTime)
+		scaleChan = savedScaleChan
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", "/index.php", nil).WithContext(ctx)
+	cancel()
+	w := &worker{name: "test", requestChan: make(chan *frankenPHPContext), maxThreads: 1}
+
+	err := w.handleRequest(&frankenPHPContext{
+		request:   req,
+		ctx:       ctx,
+		done:      make(chan any),
+		startedAt: time.Now(),
+	})
+
+	assert.NoError(t, err)
+	assert.Zero(t, w.queuedRequests.Load())
+}
+
+// TestRestartWorkersForceKillsStuckThread verifies the drain path does
+// not hang when a worker is stuck in a blocking PHP call (sleep, etc.).
+// macOS has no realtime signals so we can't unblock sleep() there; skip.
+func TestRestartWorkersForceKillsStuckThread(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" && runtime.GOOS != "windows" {
+		t.Skipf("force-kill cannot interrupt blocking syscalls on %s", runtime.GOOS)
+	}
+
+	prev := rebootGracePeriod
+	rebootGracePeriod = 500 * time.Millisecond
+	t.Cleanup(func() { rebootGracePeriod = prev })
+
+	cwd, _ := os.Getwd()
+	testDataDir := cwd + "/testdata/"
+
+	require.NoError(t, Init(
+		WithWorkers("sleep-worker", testDataDir+"worker-sleep.php", 1),
+		WithNumThreads(2),
+	))
+	t.Cleanup(Shutdown)
+
+	// Marker file the worker touches right before sleep(); per-run path
+	// so a stale file from a prior test can't fool the poll below.
+	markerFile := filepath.Join(t.TempDir(), "sleep-worker-in-sleep")
+
+	// Worker handles the request, then sleep(60). Recorder lets us
+	// assert post-sleep code never runs (would indicate the VM interrupt
+	// didn't fire and only drainChan got picked up).
+	recorder := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		req := httptest.NewRequest("GET", "http://example.com/worker-sleep.php", nil)
+		req.Header.Set("Sleep-Marker", markerFile)
+		fr, err := NewRequestWithContext(req, WithRequestDocumentRoot(testDataDir, false))
+		if err != nil {
+			return
+		}
+		_ = ServeHTTP(recorder, fr)
+	}()
+
+	// Confirm the worker is parked in sleep() before triggering the
+	// restart, so we exercise the force-kill path and not drainChan.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(markerFile)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond, "worker never entered sleep()")
+
+	start := time.Now()
+	RestartWorkers()
+	elapsed := time.Since(start)
+
+	// Test grace period (500ms) + 3s slack for signal dispatch, VM tick, restart loop.
+	const budget = 4 * time.Second
+	assert.Less(t, elapsed, budget, "drain must force-kill the stuck thread within the grace period")
+
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server request goroutine did not complete after drain")
+	}
+	assert.NotContains(t, recorder.Body.String(), "should not reach",
+		"VM interrupt was never observed; sleep returned naturally")
+}
+
+// Init() must not return, nor the runtime tear SAPI/TSRM down, while a worker
+// that failed to boot is still inside its shutdown handler
+func TestInitJoinsAThreadStuckInStartupTeardown(t *testing.T) {
+	t.Cleanup(Shutdown)
+
+	var failedThread *phpThread
+	held := make(chan struct{})
+	release := make(chan struct{})
+	initDone := make(chan error, 1)
+
+	go func() {
+		initDone <- Init(
+			WithNumThreads(2),
+			WithWorkers("held-failing-worker", testDataPath+"/failing-worker.php", 1,
+				WithWorkerMaxFailures(0),
+				WithWorkerOnShutdown(func(threadIndex int) {
+					failedThread = phpThreads[threadIndex]
+					close(held)
+					<-release
+				}),
+			),
+		)
+	}()
+
+	select {
+	case <-held:
+	case err := <-initDone:
+		t.Fatalf("Init returned before the failed worker thread started its teardown: %v", err)
+	}
+
+	select {
+	case err := <-initDone:
+		t.Fatalf("Init returned while the failed worker thread was still shutting down (state: %s, error: %v)", failedThread.state.Name(), err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	require.True(t, failedThread.state.Is(state.ShuttingDown), "thread should still be shutting down")
+	close(release)
+
+	assert.Error(t, <-initDone, "a worker failing to boot must fail Init")
+	assert.True(t, failedThread.state.Is(state.Reserved), "the thread must have exited and been reclaimed before Init returned, got: "+failedThread.state.Name())
+}
+
+// a reboot that meets a booting worker waits for its thread to settle, and a
+// worker that then gives up only reaches Done: Init() must still return
+func TestInitReturnsWhenARebootWaitsOnAWorkerThatGivesUp(t *testing.T) {
+	initDone := make(chan error, 1)
+	go func() {
+		initDone <- Init(
+			WithWorkers("reset-then-fail", testDataPath+"/worker-reset-then-fail.php", 1, WithWorkerMaxFailures(2)),
+			WithNumThreads(1),
+		)
+	}()
+
+	select {
+	case err := <-initDone:
+		require.ErrorContains(t, err, "too many consecutive failures")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Init() hung behind a reboot waiting for a worker thread that ended on its own")
+	}
+}
+
+func TestWorkerStartupLogOwnsMessage(t *testing.T) {
+	const message = "worker startup\x00\xff"
+	data := []byte(message)
+	capture := &workerStartupLogCapture{}
+	fc := &frankenPHPContext{ctx: context.Background(), logger: slog.New(capture)}
+	oldThreads := phpThreads
+	phpThreads = []*phpThread{{handler: &regularThread{fc: fc}}}
+	t.Cleanup(func() { phpThreads = oldThreads })
+
+	// Reflection bridges C argument types, which cannot be imported in a Go test file.
+	fn := reflect.ValueOf(go_ub_write)
+	signature := fn.Type()
+	result := fn.Call([]reflect.Value{
+		reflect.Zero(signature.In(0)),
+		reflect.NewAt(signature.In(1).Elem(), unsafe.Pointer(unsafe.SliceData(data))),
+		reflect.ValueOf(len(data)).Convert(signature.In(2)),
+	})
+	require.Equal(t, uint64(len(data)), result[0].Uint())
+	require.False(t, result[1].Bool())
+
+	// A log handler may retain the record after PHP reuses its output buffer.
+	for i := range data {
+		data[i] = 'Z'
+	}
+	require.Len(t, capture.records, 1)
+	assert.Equal(t, message, capture.records[0].Message)
+	assert.Equal(t, slog.LevelInfo, capture.records[0].Level)
+}
+
+type workerStartupLogCapture struct {
+	records []slog.Record
+}
+
+func (h *workerStartupLogCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (h *workerStartupLogCapture) Handle(_ context.Context, record slog.Record) error {
+	h.records = append(h.records, record.Clone())
+	return nil
+}
+func (h *workerStartupLogCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *workerStartupLogCapture) WithGroup(string) slog.Handler      { return h }

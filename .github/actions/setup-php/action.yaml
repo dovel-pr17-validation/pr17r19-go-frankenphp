@@ -1,0 +1,21 @@
+name: setup-php
+description: Setup PHP in ZTS + debug mode with FrankenPHP's standard configuration
+inputs:
+  php-version:
+    description: PHP version (e.g. "8.5")
+    required: false
+    default: "8.5"
+runs:
+  using: composite
+  steps:
+    - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+      with:
+        php-version: ${{ inputs.php-version }}
+        ini-file: development
+        # JIT's fixed-address mappings can race Go thread creation during startup.
+        ini-values: opcache.jit=disable
+        coverage: none
+        tools: none
+      env:
+        phpts: ts
+        debug: true

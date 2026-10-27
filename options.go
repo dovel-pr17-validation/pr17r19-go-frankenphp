@@ -1,0 +1,348 @@
+package frankenphp
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+// defaultMaxConsecutiveFailures is the default maximum number of consecutive failures before panicking
+const defaultMaxConsecutiveFailures = 6
+
+// Option instances allow to configure FrankenPHP.
+type Option func(h *opt) error
+
+// WorkerOption instances allow configuring FrankenPHP worker.
+type WorkerOption func(*workerOpt) error
+
+// ServerOption instances allow configuring a server.
+type ServerOption func(*Server) error
+
+// opt contains the available options.
+//
+// If you change this, also update the Caddy module and the documentation.
+type opt struct {
+	hotReloadOpt
+
+	ctx         context.Context
+	numThreads  int
+	maxThreads  int
+	workers     []workerOpt
+	logger      *slog.Logger
+	metrics     Metrics
+	phpIni      map[string]string
+	maxWaitTime time.Duration
+	maxIdleTime time.Duration
+	maxRequests int
+	servers     []*Server
+}
+
+type workerOpt struct {
+	mercureContext
+
+	name                   string
+	fileName               string
+	declaredFileName       string
+	num                    int
+	maxThreads             int
+	env                    PreparedEnv
+	requestOptions         []RequestOption
+	watch                  []string
+	matchRequest           func(*http.Request) bool
+	maxConsecutiveFailures int
+	extensionWorkers       *extensionWorkers
+	onThreadReady          func(int)
+	onThreadShutdown       func(int)
+	onServerStartup        func()
+	onServerShutdown       func()
+	server                 *Server
+}
+
+// WithContext sets the main context to use.
+func WithContext(ctx context.Context) Option {
+	return func(h *opt) error {
+		h.ctx = ctx
+
+		return nil
+	}
+}
+
+// WithNumThreads configures the number of PHP threads to start for the
+// requests no worker serves. Worker threads come on top of it.
+func WithNumThreads(numThreads int) Option {
+	return func(o *opt) error {
+		o.numThreads = numThreads
+
+		return nil
+	}
+}
+
+// WithMaxThreads limits how many threads may run at once, workers included.
+// A negative value derives that limit from the memory available.
+func WithMaxThreads(maxThreads int) Option {
+	return func(o *opt) error {
+		o.maxThreads = maxThreads
+
+		return nil
+	}
+}
+
+func WithMetrics(m Metrics) Option {
+	return func(o *opt) error {
+		o.metrics = m
+
+		return nil
+	}
+}
+
+// WithWorkers configures the PHP workers to start
+func WithWorkers(name, fileName string, num int, options ...WorkerOption) Option {
+	return func(o *opt) error {
+		worker := workerOpt{
+			name:                   name,
+			fileName:               fileName,
+			num:                    num,
+			env:                    PrepareEnv(nil),
+			watch:                  []string{},
+			maxConsecutiveFailures: defaultMaxConsecutiveFailures,
+		}
+
+		for _, option := range options {
+			if err := option(&worker); err != nil {
+				return err
+			}
+		}
+
+		o.workers = append(o.workers, worker)
+
+		return nil
+	}
+}
+
+// EXPERIMENTAL: WithExtensionWorkers allow extensions to create workers.
+//
+// A worker script with the provided name, fileName and thread count will be registered, along with additional
+// configuration through WorkerOptions.
+//
+// Workers are designed to run indefinitely and will be gracefully shut down when FrankenPHP shuts down.
+//
+// Extension workers count as worker threads: they come on top of num_threads, and Init() returns an error when
+// max_threads has no room for them. Don't be greedy.
+func WithExtensionWorkers(name, fileName string, numThreads int, options ...WorkerOption) (Workers, Option) {
+	w := &extensionWorkers{
+		name:     name,
+		fileName: fileName,
+		num:      numThreads,
+	}
+
+	w.options = append(options, withExtensionWorkers(w))
+
+	return w, WithWorkers(w.name, w.fileName, w.num, w.options...)
+}
+
+// WithLogger configures the global logger to use.
+func WithLogger(l *slog.Logger) Option {
+	return func(o *opt) error {
+		o.logger = l
+
+		return nil
+	}
+}
+
+// WithPhpIni configures user defined PHP ini settings.
+func WithPhpIni(overrides map[string]string) Option {
+	return func(o *opt) error {
+		o.phpIni = overrides
+		return nil
+	}
+}
+
+// WithMaxWaitTime configures the max time a request may be stalled waiting for a thread.
+func WithMaxWaitTime(maxWaitTime time.Duration) Option {
+	return func(o *opt) error {
+		o.maxWaitTime = maxWaitTime
+
+		return nil
+	}
+}
+
+// WithMaxIdleTime configures the max time an autoscaled thread may be idle before being deactivated.
+func WithMaxIdleTime(maxIdleTime time.Duration) Option {
+	return func(o *opt) error {
+		o.maxIdleTime = maxIdleTime
+
+		return nil
+	}
+}
+
+// EXPERIMENTAL: WithMaxRequests sets the default max requests before restarting a PHP thread (0 = unlimited). Applies to regular and worker threads.
+func WithMaxRequests(maxRequests int) Option {
+	return func(o *opt) error {
+		o.maxRequests = maxRequests
+
+		return nil
+	}
+}
+
+// WithWorkerEnv sets environment variables for the worker
+func WithWorkerEnv(env map[string]string) WorkerOption {
+	return func(w *workerOpt) error {
+		w.env = PrepareEnv(env)
+
+		return nil
+	}
+}
+
+// WithWorkerRequestOptions sets options for the main dummy request created for the worker
+func WithWorkerRequestOptions(options ...RequestOption) WorkerOption {
+	return func(w *workerOpt) error {
+		w.requestOptions = append(w.requestOptions, options...)
+
+		return nil
+	}
+}
+
+// WithWorkerMaxThreads sets the max number of threads for this specific worker
+func WithWorkerMaxThreads(num int) WorkerOption {
+	return func(w *workerOpt) error {
+		w.maxThreads = num
+
+		return nil
+	}
+}
+
+// WithWorkerWatchMode sets directories to watch for file changes
+func WithWorkerWatchMode(watch []string) WorkerOption {
+	return func(w *workerOpt) error {
+		w.watch = watch
+
+		return nil
+	}
+}
+
+// WithWorkerMatcher sets a request matcher for this worker
+// if the matcher returns true, the worker will be used to handle the request
+// if no request matcher is set, matching happens only by path (filename == root + request path)
+func WithWorkerMatcher(matcherFunc func(*http.Request) bool) WorkerOption {
+	return func(w *workerOpt) error {
+		w.matchRequest = matcherFunc
+		return nil
+	}
+}
+
+// WithWorkerServerScope scopes the worker to a server instance.
+// Only requests that are handled by the server instance will reach the worker.
+func WithWorkerServerScope(s *Server) WorkerOption {
+	return func(w *workerOpt) error {
+		w.server = s
+
+		return nil
+	}
+}
+
+// WithWorkerMaxFailures sets the maximum number of consecutive failures before panicking
+func WithWorkerMaxFailures(maxFailures int) WorkerOption {
+	return func(w *workerOpt) error {
+		if maxFailures < -1 {
+			return fmt.Errorf("max consecutive failures must be >= -1, got %d", maxFailures)
+		}
+		w.maxConsecutiveFailures = maxFailures
+
+		return nil
+	}
+}
+
+func WithWorkerOnReady(f func(int)) WorkerOption {
+	return func(w *workerOpt) error {
+		w.onThreadReady = f
+
+		return nil
+	}
+}
+
+func WithWorkerOnShutdown(f func(int)) WorkerOption {
+	return func(w *workerOpt) error {
+		w.onThreadShutdown = f
+
+		return nil
+	}
+}
+
+// WithWorkerOnServerStartup adds a function to be called right after server startup. Useful for extensions.
+func WithWorkerOnServerStartup(f func()) WorkerOption {
+	return func(w *workerOpt) error {
+		w.onServerStartup = f
+
+		return nil
+	}
+}
+
+// WithWorkerOnServerShutdown adds a function to be called right before server shutdown. Useful for extensions.
+func WithWorkerOnServerShutdown(f func()) WorkerOption {
+	return func(w *workerOpt) error {
+		w.onServerShutdown = f
+
+		return nil
+	}
+}
+
+func withExtensionWorkers(w *extensionWorkers) WorkerOption {
+	return func(wo *workerOpt) error {
+		wo.extensionWorkers = w
+
+		return nil
+	}
+}
+
+// WithServer starts FrankenPHP with the given Server instance.
+// After registering, it will be possible to call Server.ServeHTTP()
+func WithServer(s *Server) Option {
+	return func(o *opt) error {
+		o.servers = append(o.servers, s)
+
+		return nil
+	}
+}
+
+// WithServerName sets the name of the server.
+func WithServerName(name string) ServerOption {
+	return func(s *Server) error {
+		s.name = name
+		s.configuredName = name
+
+		return nil
+	}
+}
+
+// WithServerLogger sets the logger for the server.
+func WithServerLogger(l *slog.Logger) ServerOption {
+	return func(s *Server) error {
+		s.logger = l
+
+		return nil
+	}
+}
+
+// WIthServerSplitPath sets the split path for the server.
+func WithServerSplitPath(splitPath []string) ServerOption {
+	return func(s *Server) error {
+		if err := normalizeSplitPath(splitPath); err != nil {
+			return err
+		}
+
+		s.splitPath = splitPath
+
+		return nil
+	}
+}
+
+// WithServerEnv sets the env for the server.
+func WithServerEnv(env map[string]string) ServerOption {
+	return func(s *Server) error {
+		s.env = PrepareEnv(env)
+
+		return nil
+	}
+}
